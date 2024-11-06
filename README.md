@@ -46,15 +46,12 @@ pip install -r requirements.txt
 The implementation supports three healthcare benchmark datasets:
 
 1. **PhysioNet Challenge 2012**
-   - 4,000 ICU stays with 35 variables
    - [Download link](https://physionet.org/content/challenge-2012/1.0.0/)
 
 2. **MIMIC-III**
-   - 59 variables benchmark
    - Requires [credentialed access](https://physionet.org/content/mimiciii/1.4/)
 
 3. **eICU**
-   - 20 variables benchmark
    - Available after [registration](https://physionet.org/content/eicu-crd/2.0/)
 
 Place the downloaded data in the `data/` directory following this structure:
