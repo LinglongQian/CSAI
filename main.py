@@ -1,478 +1,567 @@
-import pickle
-import torch.optim as optim
-from losses import DiceBCELoss
-from utils import *
+"""
+Main training script for CSAI model.
+
+This script handles:
+- Dataset loading and preprocessing
+- Model training and evaluation
+- Cross-validation experiments
+- Result saving and visualization
+"""
+
 import os
+import pickle
 import datetime
-import matplotlib.pyplot as plt
-import numpy as np
 import argparse
+import copy
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import torch
+import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import warnings
 warnings.filterwarnings("ignore")
 
-# Define Arguments
-parser = argparse.ArgumentParser()
-parser.add_argument("--gpu_id", type=str, default='0')
-parser.add_argument("--model_name", type=str, default='Brits')
-parser.add_argument("--dataset", type=str, default='physionet')
-parser.add_argument("--hours", type=int, default='48')
-parser.add_argument("--epoch", type=int, default=300)
-parser.add_argument("--lr", type=float, default=0.0005)
-parser.add_argument("--batchsize", type=int, default=64)
-parser.add_argument("--weight_decay", type=float, default=0.00001)
+from utils import (
+    setup_seed, normalize, calculate_metrics,
+    get_polarfig, ExperimentLogger, save_training_info,
+    non_uniform_sample_loader_bidirectional, evaluate, config
+)
+from losses import DiceBCELoss
 
-parser.add_argument("--imputation_weight", type=float, default=0.3)
-parser.add_argument("--classification_weight", type=float, default=1)
-parser.add_argument("--consistency_weight", type=float, default=0.1)
-
-parser.add_argument("--hiddens", type=int, default=108)
-parser.add_argument("--channels", type=int, default=64)
-parser.add_argument("--removal_percent", type=int, default=10)
-parser.add_argument("--task", type=str, default='I')  # I: Imputation, C: Classification
-parser.add_argument("--out_size", type=int, default=1)
-
-parser.add_argument("--increase_factor", type=float, default=0.5)
-parser.add_argument("--step_channels", type=int, default=512)
-parser.add_argument("--seed", type=int, default=1)
-parser.add_argument("--model_path", type=str, default='./log')
-parser.add_argument("--pre_model", type=str, default='.')
-
-args, unknown = parser.parse_known_args()
-
-# GPU Configuration
-gpu_id = args.gpu_id
-os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-args = config(args)
-# Loading the kfold dataset
-kfold_data = pickle.load(open(args.data_path, 'rb'))
-kfold_label = pickle.load(open(args.label_path, 'rb'))
-
-model_detail = '{}_remove_{}'.format(args.model_name, args.removal_percent)
-
-date_str = str(datetime.datetime.now().strftime('%Y%m%d.%H.%M.%S'))
-rootdir = '%s/%s/%s/task_%s/%s' % (args.model_path,
-                                    args.dataset,
-                                    model_detail,
-                                    args.task,
-                                    date_str)
-kfold_best = {}
-for fold in range(5):
-    # For logging purpose, create several directories
-    dir = rootdir + '/fold_%d/' % (fold)
-
-    if not os.path.exists(dir):
-        os.makedirs(dir)
-        os.makedirs(dir + 'tflog/')
-        os.makedirs(dir + 'model_state/')
-
-    # Text Logging
-    f = open(dir + 'log.txt', 'a')
-    writelog(f, '---------------')
-    writelog(f, 'Model: %s' % model_detail)
-    writelog(f, 'Hidden Units: %d' % args.hiddens)
-    writelog(f, 'Times: %d' % args.times)
-    writelog(f, 'Increase_factor: %s' % args.increase_factor)
-    writelog(f, 'Step channels: %s' % args.step_channels)
-    writelog(f, 'Task: %s' % args.task)
-    writelog(f, 'Pre model: %s' % args.pre_model)
-    writelog(f, '---------------')
-    writelog(f, 'Dataset: %s' % args.dataset)
-    writelog(f, 'Hours: %s' % args.hours)
-    writelog(f, 'Removal: %s' % args.removal_percent)
-    writelog(f, '---------------')
-    writelog(f, 'Fold: %d' % fold)
-    writelog(f, 'Learning Rate: %.5f' % args.lr)
-    writelog(f, 'Batch Size: %d' % args.batchsize)
-    writelog(f, 'Weight decay: %.5f' % args.weight_decay)
-    writelog(f, 'Imputation Weight: %.3f' % args.imputation_weight)
-    writelog(f, 'Consitency Loss Imputation Weight: %.3f' % args.consistency_weight)
-    writelog(f, 'Classification Weight: %.3f' % args.classification_weight)
-    writelog(f, '---------------')
-    writelog(f, 'TRAINING LOG')
-
-    # Process Defined Fold
-    writelog(f, '---------------')
-    writelog(f, 'FOLD ' + str(fold))
-
-    # Tensorboard Logging
-    tfw_train = SummaryWriter(log_dir=dir + 'tflog/train_')
-    tfw_valid = SummaryWriter(log_dir=dir + 'tflog/valid_')
-    tfw_test = SummaryWriter(log_dir=dir + 'tflog/test_')
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='CSAI Training Script')
     
-    tfw = {'train': tfw_train,
-           'valid': tfw_valid,
-           'test': tfw_test}
+    # Hardware configs
+    parser.add_argument("--gpu_id", type=str, default='0')
+    parser.add_argument("--seed", type=int, default=1)
+    
+    # Model configs
+    parser.add_argument("--model_name", type=str, default='CSAI')
+    parser.add_argument("--hiddens", type=int, default=108)
+    parser.add_argument("--channels", type=int, default=64)
+    parser.add_argument("--step_channels", type=int, default=512)
+    parser.add_argument("--pre_model", type=str, default='.')
+    
+    # Dataset configs
+    parser.add_argument("--dataset", type=str, default='physionet')
+    parser.add_argument("--hours", type=int, default=48)
+    parser.add_argument("--removal_percent", type=int, default=10)
+    
+    # Training configs
+    parser.add_argument("--task", type=str, default='I')
+    parser.add_argument("--epoch", type=int, default=300)
+    parser.add_argument("--lr", type=float, default=0.0005)
+    parser.add_argument("--batchsize", type=int, default=64)
+    parser.add_argument("--weight_decay", type=float, default=0.00001)
+    
+    # Loss weights
+    parser.add_argument("--imputation_weight", type=float, default=0.3)
+    parser.add_argument("--classification_weight", type=float, default=1)
+    parser.add_argument("--consistency_weight", type=float, default=0.1)
+    parser.add_argument("--increase_factor", type=float, default=0.5)
+    
+    # Output configs
+    parser.add_argument("--model_path", type=str, default='./log')
+    parser.add_argument("--out_size", type=int, default=1)
+    
+    args = parser.parse_args()
+    return args
 
-    # Get dataset
-    train_data = kfold_data[fold][0]
-    train_label = kfold_label[fold][0]
+def setup_environment(args):
+    """Setup GPU and random seeds."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    setup_seed(args.seed)
+    return args
 
-    valid_data = kfold_data[fold][1]
-    valid_label = kfold_label[fold][1]
+def load_data(args) -> Tuple[List, List]:
+    """Load and verify dataset."""
+    try:
+        kfold_data = pickle.load(open(args.data_path, 'rb'))
+        kfold_label = pickle.load(open(args.label_path, 'rb'))
+        return kfold_data, kfold_label
+    except Exception as e:
+        raise RuntimeError(f"Failed to load data: {e}")
+    
+def setup_fold_tracking(args, fold: int) -> Tuple[ExperimentLogger, Dict[str, SummaryWriter], Path]:
+    """Setup logging and tracking for a fold."""
+    date_str = datetime.datetime.now().strftime('%Y%m%d.%H.%M.%S')
+    fold_dir = Path(args.model_path) / args.dataset / \
+               f'{args.model_name}_remove_{args.removal_percent}' / \
+               f'task_{args.task}' / date_str / f'fold_{fold}'
+    
+    # Create directories
+    for subdir in ['tflog', 'model_state']:
+        (fold_dir / subdir).mkdir(parents=True, exist_ok=True)
+    
+    # Initialize logger
+    logger = ExperimentLogger(fold_dir / 'log.txt')
+    logger.log_config(args)
+    
+    # Setup tensorboard writers
+    writers = {
+        'train': SummaryWriter(fold_dir / 'tflog/train'),
+        'valid': SummaryWriter(fold_dir / 'tflog/valid'),
+        'test': SummaryWriter(fold_dir / 'tflog/test')
+    }
+    
+    return logger, writers, fold_dir
 
-    test_data = kfold_data[fold][2]
-    test_label = kfold_label[fold][2]
+def prepare_fold_data(
+    fold: int,
+    kfold_data: List,
+    kfold_label: List,
+    args
+) -> Tuple[Dict[str, torch.utils.data.DataLoader], Dict[str, float]]:
+    """Prepare data loaders for a fold."""
+    # Get fold data
+    train_data, valid_data, test_data = kfold_data[fold]
+    train_label, valid_label, test_label = kfold_label[fold]
+    
+    # Log data statistics
+    print('Unbalanced ratios:')
+    print(f'Train: {sum(train_label)/len(train_label):.3f}')
+    print(f'Valid: {sum(valid_label)/len(valid_label):.3f}')
+    print(f'Test: {sum(test_label)/len(test_label):.3f}')
+    
+    # Normalize data
+    train_data, mean_set, std_set, intervals = normalize(
+        data=train_data,
+        mean=[],
+        std=[],
+        compute_intervals=True
+    )
+    valid_data, _, _ = normalize(valid_data, mean_set, std_set)
+    test_data, _, _ = normalize(test_data, mean_set, std_set)
+    
+    # Calculate missing rates
+    missing_rates = {
+        'train': np.isnan(train_data).sum(axis=(0,1)) / (train_data.shape[0] * train_data.shape[1]),
+        'valid': np.isnan(valid_data).sum(axis=(0,1)) / (valid_data.shape[0] * valid_data.shape[1]),
+        'test': np.isnan(test_data).sum(axis=(0,1)) / (test_data.shape[0] * test_data.shape[1])
+    }
+    
+    # Create data loaders
+    train_loader, replacement_probs = non_uniform_sample_loader_bidirectional(
+        train_data, train_label, args.batchsize, args.removal_percent, 
+        increase_factor=args.increase_factor
+    )
+    
+    valid_loader, _ = non_uniform_sample_loader_bidirectional(
+        valid_data, valid_label, args.batchsize, args.removal_percent, 
+        pre_replacement_probabilities=replacement_probs
+    )
+    
+    test_loader, _ = non_uniform_sample_loader_bidirectional(
+        test_data, test_label, args.batchsize, args.removal_percent,
+        pre_replacement_probabilities=replacement_probs
+    )
+    
+    loaders = {
+        'train': train_loader,
+        'valid': valid_loader,
+        'test': test_loader
+    }
+    
+    return loaders, missing_rates, intervals, replacement_probs
 
-    print('Unbalanced ratio of train_data: ', sum(train_label) / len(train_label))
-    print('Unbalanced ratio of valid_data: ', sum(valid_label) / len(valid_label))
-    print('Unbalanced ratio of test_data: ', sum(test_label) / len(test_label))
-
-    # Normalization
-    writelog(f, 'Normalization')
-    train_data, mean_set, std_set, intervals = normalize(data=train_data, mean=[], std=[], compute_intervals=True)
-    valid_data, m, s = normalize(valid_data, mean_set, std_set)
-    test_data, m, s = normalize(test_data, mean_set, std_set)
-
-    train_missing_rates = np.isnan(train_data).sum(axis=(0, 1)) / (train_data.shape[0] * train_data.shape[1])
-    valid_missing_rates = np.isnan(valid_data).sum(axis=(0, 1)) / (valid_data.shape[0] * valid_data.shape[1])
-    test_missing_rates = np.isnan(test_data).sum(axis=(0, 1)) / (test_data.shape[0] * test_data.shape[1])
-    # Define Loaders        
-    train_loader, train_replacement_probabilities = non_uniform_sample_loader_bidirectional(data=train_data, label=train_label, batch_size=args.batchsize, removal_percent=args.removal_percent, increase_factor=args.increase_factor)
-    valid_loader, _ = non_uniform_sample_loader_bidirectional(valid_data, valid_label, args.batchsize, args.removal_percent, pre_replacement_probabilities=train_replacement_probabilities)
-    test_loader, _ = non_uniform_sample_loader_bidirectional(test_data, test_label, args.batchsize, args.removal_percent, pre_replacement_probabilities=train_replacement_probabilities)
-
-
-    dataloaders = {'train': train_loader,
-                    'valid': valid_loader,
-                    'test': test_loader}
-    # Remove Data
-    del train_data, train_label, valid_data, valid_label, test_data, test_label
-
-    # Define Model
-    criterion = DiceBCELoss().to(args.device)
-
-    if args.model_name == 'Brits':
+def initialize_model(args, intervals):
+    """Initialize model, criterion, and optimizer."""
+    # Import appropriate model
+    if args.model_name == 'CSAI':
+        from models import bcsai as net
+    elif args.model_name == 'Brits':
         from models import brits as net
+    elif args.model_name == 'Brits_gru':
+        from models import brits_gru as net  
     elif args.model_name == 'GRUD':
         from models import gru_d as net
     elif args.model_name == 'BVRIN':
         from models import bvrin as net
     elif args.model_name == 'MRNN':
         from models import m_rnn as net
-    elif args.model_name == 'Brits_gru':
-        from models import brits_gru as net        
-    elif args.model_name == 'CSAI':
-        from models import bcsai as net  
-
-    if args.task == 'I':
-        model = net(args=args, medians_df=intervals).to(args.device)
-    elif args.task == 'C':
-        model = net(args=args, medians_df=intervals, get_y=True).to(args.device)
-
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    writelog(f, 'Total params is {}'.format(total_params))
-
-    # Define Optimizer
-    optimizer = optim.Adam([
-        {'params': list(model.parameters()), 'lr': args.lr, 'weight_decay': args.weight_decay}])
-
-    # scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[0.5 * args.epoch, 0.75 * args.epoch], gamma=0.1)
-
-    train = {
-        'epoch': 0,
-        'mae': 9999,
-        'auc': 0,
-    }
-
-    valid = {
-        'epoch': 0,
-        'mae': 9999,
-        'auc': 0,
-    }
-    
-    test = {
-        'epoch': 0,
-        'mae': 9999,
-        'auc': 0,
-    }
-
-    test_bets = {
-        'epoch': 0,
-        'mae': 0,
-        'mre': 0,
-        'acc': 0,
-        'auc': 0,
-        'prec_macro': 0,
-        'recall_macro': 0,
-        'f1_macro': 0,
-        'bal_acc': 0,
-    }
-
-    test_bets_train = {
-        'epoch': 0,
-        'mae': 0,
-        'mre': 0,
-        'acc': 0,
-        'auc': 0,
-        'prec_macro': 0,
-        'recall_macro': 0,
-        'f1_macro': 0,
-        'bal_acc': 0,
-    }
-
-    test_bets_valid = {
-        'epoch': 0,
-        'mae': 0,
-        'mre': 0,
-        'acc': 0,
-        'auc': 0,
-        'prec_macro': 0,
-        'recall_macro': 0,
-        'f1_macro': 0,
-        'bal_acc': 0,
-    }
-
-    train_info = {'Loss':[], 'Loss_imputation':[], 'Loss_classification':[], 'Mae':[], 'Mre':[], 'Auc':[], 'prec_macro':[], 'recall_macro':[], 'f1_macro':[], 'bal_acc':[]}
-    valid_info = {'Loss':[], 'Loss_imputation':[], 'Loss_classification':[], 'Mae':[], 'Mre':[], 'Auc':[], 'prec_macro':[], 'recall_macro':[], 'f1_macro':[], 'bal_acc':[]}
-    test_info = {'Loss':[], 'Loss_imputation':[], 'Loss_classification':[], 'Mae':[], 'Mre':[], 'Auc':[], 'prec_macro':[], 'recall_macro':[], 'f1_macro':[], 'bal_acc':[]}
-
-    # Training & Validation Loop
-    for epoch in range(args.epoch):
-        writelog(f, '------ Epoch ' + str(epoch))
-        writelog(f, '-- Training')
-        train_res = training(phase='train', model=model, optimizer=optimizer, criterion=criterion, args=args, data=dataloaders['train'], f=f, task=args.task, tfw=tfw, epoch=epoch)
-        train_info['Loss'].append(train_res['loss'])
-        train_info['Loss_imputation'].append(train_res['loss_imputation'])
-        train_info['Mae'].append(train_res['mae'])
-        train_info['Mre'].append(train_res['mre'])
-
-        writelog(f, '-- Validation')
-        valid_res = evaluate(phase='valid', model=model, criterion=criterion, args=args, data=dataloaders['valid'], f=f, task=args.task, tfw=tfw, epoch=epoch)
-        valid_info['Loss'].append(valid_res['loss'])
-        valid_info['Loss_imputation'].append(valid_res['loss_imputation'])
-        valid_info['Mae'].append(valid_res['mae'])
-        valid_info['Mre'].append(valid_res['mre'])
-
-        writelog(f, '-- Testing')
-        test_res = evaluate(phase='test', model=model, criterion=criterion, args=args, data=dataloaders['test'], f=f, task=args.task, tfw=tfw, epoch=epoch)
-        test_info['Loss'].append(test_res['loss'])
-        test_info['Loss_imputation'].append(test_res['loss_imputation'])
-        test_info['Mae'].append(test_res['mae'])
-        test_info['Mre'].append(test_res['mre'])
-        
-        # scheduler.step()
-        
-        if args.task == 'I':
-            if train_res['mae'] < train['mae']:
-                # torch.save(model, '%s/model/model_%d_best_train_%s.pt' % (dir, fold, args.task))
-                torch.save(model.state_dict(), '%s/model_state/model_%d_best_train_%s_state_dict.pth' % (dir, fold, args.task))
-                train['mae'] = train_res['mae']
-                train['epoch'] = epoch
-                test_bets_train['epoch'] = epoch
-                test_bets_train['mae'] = test_res['mae']
-                test_bets_train['mre'] = test_res['mre']
-                get_polarfig(args, train_replacement_probabilities, train_missing_rates, train_res['feature_mae'], dir, fold, 'train', args.attributes)
-
-            if valid_res['mae'] < valid['mae']:
-                # torch.save(model, '%s/model/model_%d_best_valid_%s.pt' % (dir, fold, args.task))
-                torch.save(model.state_dict(), '%s/model_state/model_%d_best_valid_%s_state_dict.pth' % (dir, fold, args.task))
-                writelog(f, 'Best validation MAE is found! Training MAE : %f' % train_res['mae'])
-                writelog(f, 'Best validation MAE is found! Validation MAE : %f' % valid_res['mae'])
-                writelog(f, 'Best validation MAE is found! Testing MAE : %f' % test_res['mae'])
-                writelog(f, 'Models at Epoch %d are saved!' % epoch)
-                valid['mae'] = valid_res['mae']
-                valid['epoch'] = epoch
-                test_bets_valid['epoch'] = epoch
-                test_bets_valid['mae'] = test_res['mae']
-                test_bets_valid['mre'] = test_res['mre']
-                get_polarfig(args, train_replacement_probabilities, valid_missing_rates, valid_res['feature_mae'], dir, fold, 'valid', args.attributes)
-
-            if test_res['mae'] < test['mae']:
-                # torch.save(model, '%s/model/model_%d_best_test_%s.pt' % (dir, fold, args.task))
-                torch.save(model.state_dict(), '%s/model_state/model_%d_best_test_%s_state_dict.pth' % (dir, fold, args.task))
-                test['mae'] = test_res['mae']
-                test['epoch'] = epoch
-                test_bets['epoch'] = epoch
-                test_bets['mae'] = test_res['mae']
-                test_bets['mre'] = test_res['mre']        
-                get_polarfig(args, train_replacement_probabilities, test_missing_rates, test_res['feature_mae'], dir, fold, 'test', args.attributes)
-
-        else:
-            train_info['Loss_classification'].append(train_res['loss_classification'])
-            train_info['Auc'].append(train_res['auc'])
-            train_info['prec_macro'].append(train_res['prec_macro'])
-            train_info['recall_macro'].append(train_res['recall_macro'])
-            train_info['f1_macro'].append(train_res['f1_macro'])
-            train_info['bal_acc'].append(train_res['bal_acc'])
-
-            valid_info['Loss_classification'].append(valid_res['loss_classification'])
-            valid_info['Auc'].append(valid_res['auc'])
-            valid_info['prec_macro'].append(valid_res['prec_macro'])
-            valid_info['recall_macro'].append(valid_res['recall_macro'])
-            valid_info['f1_macro'].append(valid_res['f1_macro'])
-            valid_info['bal_acc'].append(valid_res['bal_acc'])
-
-            test_info['Loss_classification'].append(test_res['loss_classification'])
-            test_info['Auc'].append(test_res['auc'])
-            test_info['prec_macro'].append(test_res['prec_macro'])
-            test_info['recall_macro'].append(test_res['recall_macro'])
-            test_info['f1_macro'].append(test_res['f1_macro'])
-            test_info['bal_acc'].append(test_res['bal_acc'])
-
-            if train_res['auc'] > train['auc']:
-                # torch.save(model, '%s/model/model_%d_best_train_%s.pt' % (dir, fold, args.task))
-                torch.save(model.state_dict(), '%s/model_state/model_%d_best_train_%s_state_dict.pth' % (dir, fold, args.task))
-                train['auc'] = train_res['auc']
-                train['epoch'] = epoch
-                test_bets_train['epoch'] = epoch
-                test_bets_train['mae'] = test_res['mae']
-                test_bets_train['mre'] = test_res['mre']
-                test_bets_train['acc'] = test_res['accuracy']
-                test_bets_train['auc'] = test_res['auc']
-                test_bets_train['prec_macro'] = test_res['prec_macro']
-                test_bets_train['recall_macro'] = test_res['recall_macro']
-                test_bets_train['f1_macro'] = test_res['f1_macro']
-                test_bets_train['bal_acc'] = test_res['bal_acc']
-                get_polarfig(args, train_replacement_probabilities, train_missing_rates, train_res['feature_mae'], dir, fold, 'train', args.attributes)
-
-            if valid_res['auc'] > valid['auc']:
-                # torch.save(model, '%s/model/model_%d_best_valid_%s.pt' % (dir, fold, args.task))
-                torch.save(model.state_dict(), '%s/model_state/model_%d_best_valid_%s_state_dict.pth' % (dir, fold, args.task))
-                writelog(f, 'Best validation AUC is found! Training AUC : %f' % train_res['auc'])
-                writelog(f, 'Best validation AUC is found! Validation AUC : %f' % valid_res['auc'])
-                writelog(f, 'Best validation AUC is found! Testing AUC : %f' % test_res['auc'])
-                writelog(f, 'Training MAE : %f' % train_res['mae'])
-                writelog(f, 'Validation MAE : %f' % valid_res['mae'])
-                writelog(f, 'Testing MAE : %f' % test_res['mae'])
-                writelog(f, 'Models at Epoch %d are saved!' % epoch)
-                valid['auc'] = valid_res['auc']
-                valid['epoch'] = epoch
-                test_bets_valid['epoch'] = epoch
-                test_bets_valid['mae'] = test_res['mae']
-                test_bets_valid['mre'] = test_res['mre']
-                test_bets_valid['acc'] = test_res['accuracy']
-                test_bets_valid['auc'] = test_res['auc']
-                test_bets_valid['prec_macro'] = test_res['prec_macro']
-                test_bets_valid['recall_macro'] = test_res['recall_macro']
-                test_bets_valid['f1_macro'] = test_res['f1_macro']
-                test_bets_valid['bal_acc'] = test_res['bal_acc']
-                get_polarfig(args, train_replacement_probabilities, valid_missing_rates, valid_res['feature_mae'], dir, fold, 'valid', args.attributes)
-
-            if test_res['auc'] > test['auc']:
-                # torch.save(model, '%s/model/model_%d_best_test_%s.pt' % (dir, fold, args.task))
-                torch.save(model.state_dict(), '%s/model_state/model_%d_best_test_%s_state_dict.pth' % (dir, fold, args.task))
-                test['auc'] = test_res['auc']
-                test['epoch'] = epoch
-                test_bets['epoch'] = epoch
-                test_bets['mae'] = test_res['mae']
-                test_bets['mre'] = test_res['mre']
-                test_bets['acc'] = test_res['accuracy']
-                test_bets['auc'] = test_res['auc']
-                test_bets['prec_macro'] = test_res['prec_macro']
-                test_bets['recall_macro'] = test_res['recall_macro']
-                test_bets['f1_macro'] = test_res['f1_macro']
-                test_bets['bal_acc'] = test_res['bal_acc']
-                get_polarfig(args, train_replacement_probabilities, test_missing_rates, test_res['feature_mae'], dir, fold, 'test', args.attributes)
-
-    writelog(f, '-- Best Test for task' + args.task + ' of FOLD' + str(fold))
-    for b in test_bets:
-        writelog(f, '%s:%f' % (b, test_bets[b]))
-    
-    writelog(f, '-- Best Test train for task' + args.task + ' of FOLD' + str(fold))
-    for b in test_bets_train:
-        writelog(f, '%s:%f' % (b, test_bets_train[b]))
-
-    writelog(f, '-- Best Test valid for task' + args.task + ' of FOLD' + str(fold))
-    for b in test_bets_valid:
-        writelog(f, '%s:%f' % (b, test_bets_valid[b]))
-
-    kfold_best[str(fold)+'test_bets'] = test_bets
-    kfold_best[str(fold)+'test_bets_train'] = test_bets_train
-    kfold_best[str(fold)+'test_bets_valid'] = test_bets_valid
-
-    writelog(f, 'END OF FOLD')
-    f.close()
-
-    #save all training recording
-    training_record = {'train': train_info,
-                    'valid': valid_info,
-                    'test': test_info}
-    pickle.dump(training_record, open('%s/training_recording_%d.pkl' % (dir, fold), 'wb'), -1)
-
-    if args.task == 'I':
-        fig, axes = plt.subplots(3, 1, figsize=(20, 20))
-        axes[0].plot(train_info['Loss'], label='Training')
-        axes[0].plot(valid_info['Loss'], label='Validation')
-        axes[0].plot(test_info['Loss'], label='Testing')
-        axes[0].legend()
-        axes[0].title.set_text('Overall osses over epoches')
-
-        axes[1].plot(train_info['Loss_imputation'], label='Training')
-        axes[1].plot(valid_info['Loss_imputation'], label='Validation')
-        axes[1].plot(test_info['Loss_imputation'], label='Testing')
-        axes[1].legend()
-        axes[1].title.set_text('Losses of imputation over epoches')
-
-        axes[2].plot(train_info['Mae'], label='Training')
-        axes[2].plot(valid_info['Mae'], label='Validation')
-        axes[2].plot(test_info['Mae'], label='Testing')
-        axes[2].legend()
-        axes[2].title.set_text('MAEs over epoches')
-
-        plt.savefig(dir+"/fold_{}_{}_performances.png".format(fold, args.task), dpi=500)
-        
     else:
-        fig, axes = plt.subplots(2, 2, figsize=(20, 20))            
-        axes[0, 0].plot(train_info['Loss'], label='Training')
-        axes[0, 0].plot(valid_info['Loss'], label='Validation')
-        axes[0, 0].plot(test_info['Loss'], label='Testing')
-        axes[0, 0].legend()
-        axes[0, 0].title.set_text('Overall osses over epoches')
+        raise ValueError(f"Unknown model: {args.model_name}")
 
-        axes[0, 1].plot(train_info['Loss_imputation'], label='Training')
-        axes[0, 1].plot(valid_info['Loss_imputation'], label='Validation')
-        axes[0, 1].plot(test_info['Loss_imputation'], label='Testing')
-        axes[0, 1].legend()
-        axes[0, 1].title.set_text('Losses of imputation over epoches')
+    # Initialize model
+    model = net(args=args, medians_df=intervals, get_y=(args.task == 'C')).to(args.device)
+    
+    # Print model size
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Total trainable parameters: {total_params:,}')
+    
+    # Initialize criterion and optimizer
+    criterion = DiceBCELoss().to(args.device)
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
+    
+    return model, criterion, optimizer
 
-        axes[1, 0].plot(train_info['Loss_classification'], label='Training')
-        axes[1, 0].plot(valid_info['Loss_classification'], label='Validation')
-        axes[1, 0].plot(test_info['Loss_classification'], label='Testing')
-        axes[1, 0].legend()
-        axes[1, 0].title.set_text('Losses of classification over epoches')
-
-        axes[1, 1].plot(train_info['Mae'], label='Training')
-        axes[1, 1].plot(valid_info['Mae'], label='Validation')
-        axes[1, 1].plot(test_info['Mae'], label='Testing')
-        axes[1, 1].legend()
-        axes[1, 1].title.set_text('MAEs over epoches')
-
-        plt.savefig(dir+"/fold_{}_{}_imputation_performances.png".format(fold, args.task), dpi=500)
-
-        fig, axes = plt.subplots(2, 2, figsize=(20, 20))
-        axes[0, 0].plot(train_info['Auc'], label='auc')
-        axes[0, 0].plot(train_info['prec_macro'], label='prec_macro')
-        axes[0, 0].plot(train_info['recall_macro'], label='recall_macro')
-        axes[0, 0].plot(train_info['f1_macro'], label='f1_macro')
-        axes[0, 0].plot(train_info['bal_acc'], label='bal_acc')
-        axes[0, 0].legend()
-        axes[0, 0].title.set_text('Training performance over epoches')
+def train_epoch(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    loader: torch.utils.data.DataLoader,
+    optimizer: torch.optim.Optimizer,
+    args,
+    epoch: int,
+    phase: str,
+    logger: ExperimentLogger,
+    writer: SummaryWriter
+) -> Dict:
+    """Train for one epoch."""
+    model.train()
+    
+    metrics = {
+        'loss': 0,
+        'loss_imputation': 0,
+        'loss_classification': 0,
+    }
+    
+    all_y = []
+    all_y_pred = []
+    all_y_score = []
+    eval_x_all = []
+    eval_m_all = []
+    imp_all = []
+    
+    for i, batch in enumerate(loader):
+        # Move data to device
+        y = batch['labels'].to(args.device)
+        eval_x = batch['evals'].to(args.device)
+        eval_m = batch['eval_masks'].to(args.device)
         
-        axes[0, 1].plot(valid_info['Auc'], label='auc')
-        axes[0, 1].plot(valid_info['prec_macro'], label='prec_macro')
-        axes[0, 1].plot(valid_info['recall_macro'], label='recall_macro')
-        axes[0, 1].plot(valid_info['f1_macro'], label='f1_macro')
-        axes[0, 1].plot(valid_info['bal_acc'], label='bal_acc')
-        axes[0, 1].legend()
-        axes[0, 1].title.set_text('Validation performance over epoches')
+        # Zero gradients
+        optimizer.zero_grad()
+        
+        # Forward pass
+        outputs = model(batch)
+        
+        # Calculate losses
+        imp_loss = outputs['loss_regression'] + outputs['loss_consistency']
+        metrics['loss_imputation'] += imp_loss.item()
+        
+        if args.task == 'C':
+            BCE_f, _ = criterion(outputs['y_score_f'], outputs['y_out_f'], y.unsqueeze(1))
+            BCE_b, _ = criterion(outputs['y_score_b'], outputs['y_out_b'], y.unsqueeze(1))
+            cls_loss = BCE_f + BCE_b
+            metrics['loss_classification'] += cls_loss.item()
+            
+            loss = (args.imputation_weight * imp_loss + 
+                   args.classification_weight * cls_loss + 
+                   args.consistency_weight * outputs['loss_consistency'])
+        else:
+            loss = (args.imputation_weight * imp_loss + 
+                   args.consistency_weight * outputs['loss_consistency'])
+        
+        metrics['loss'] += loss.item()
+        
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+        
+        # Collect data for metrics
+        eval_x_all.append(eval_x.cpu().numpy())
+        eval_m_all.append(eval_m.cpu().numpy())
+        imp_all.append(outputs['imputation'].detach().cpu().numpy())
+        
+        if args.task == 'C':
+            all_y.append(y.cpu().numpy())
+            y_score = (outputs['y_score_f'] + outputs['y_score_b']) / 2
+            all_y_score.append(y_score.detach().cpu().numpy())
+            all_y_pred.append(np.round(y_score.detach().cpu().numpy()))
+    
+    # Calculate final metrics
+    metrics = {k: v / (i + 1) for k, v in metrics.items()}
+    
+    # Calculate imputation metrics
+    eval_x_all = np.concatenate(eval_x_all)
+    eval_m_all = np.concatenate(eval_m_all)
+    imp_all = np.concatenate(imp_all)
+    
+    metrics['mae'] = np.sum(np.abs(eval_x_all - imp_all) * eval_m_all) / np.sum(eval_m_all)
+    metrics['mre'] = (np.sum(np.abs(eval_x_all - imp_all) * eval_m_all) / 
+                     np.sum(np.abs(eval_x_all) * eval_m_all))
+    metrics['feature_mae'] = np.mean(np.abs(eval_x_all - imp_all) * eval_m_all, axis=(0,1))
+    
+    # Calculate classification metrics
+    if args.task == 'C':
+        all_y = np.concatenate(all_y)
+        all_y_score = np.concatenate(all_y_score)
+        all_y_pred = np.concatenate(all_y_pred)
+        
+        cls_metrics = calculate_metrics(all_y, all_y_score, all_y_pred)
+        metrics.update(cls_metrics)
+    
+    # Log metrics
+    logger.log(f'Loss: {metrics["loss"]:.6f}')
+    logger.log(f'MAE: {metrics["mae"]:.6f}')
+    if args.task == 'C':
+        logger.log(f'AUC: {metrics["auc"]:.6f}')
+    
+    # Log to tensorboard
+    if writer is not None:
+        for name, value in metrics.items():
+            if isinstance(value, (int, float)):
+                writer.add_scalar(f'{phase}/{name}', value, epoch)
+    
+    return metrics
 
-        axes[1, 0].plot(test_info['Auc'], label='auc')
-        axes[1, 0].plot(test_info['prec_macro'], label='prec_macro')
-        axes[1, 0].plot(test_info['recall_macro'], label='recall_macro')
-        axes[1, 0].plot(test_info['f1_macro'], label='f1_macro')
-        axes[1, 0].plot(test_info['bal_acc'], label='bal_acc')
-        axes[1, 0].legend()
-        axes[1, 0].title.set_text('Test performance over epoches')
+def train_fold(
+    fold: int,
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    loaders: Dict[str, torch.utils.data.DataLoader],
+    args,
+    logger: ExperimentLogger,
+    writers: Dict[str, SummaryWriter],
+    save_dir: Path,
+    missing_rates: Dict[str, np.ndarray],
+    replacement_probs: np.ndarray
+) -> Dict:
+    """Train and evaluate a single fold."""
+    best_metrics = {
+        'train': {'epoch': 0, 'mae': float('inf'), 'auc': 0},
+        'valid': {'epoch': 0, 'mae': float('inf'), 'auc': 0},
+        'test': {'epoch': 0, 'mae': float('inf'), 'auc': 0},
+    }
 
-        axes[1, 1].plot(train_info['Auc'], label='auc of training')
-        axes[1, 1].plot(valid_info['Auc'], label='auc of validation')
-        axes[1, 1].plot(test_info['Auc'], label='auc of test')
-        axes[1, 1].legend()
-        axes[1, 1].title.set_text('AUCs over epoches')
+    train_info = {
+        'Loss': [], 'Loss_imputation': [], 'Loss_classification': [],
+        'Mae': [], 'Mre': [], 'Auc': [], 'prec_macro': [],
+        'recall_macro': [], 'f1_macro': [], 'bal_acc': []
+    }
+    valid_info = copy.deepcopy(train_info)
+    test_info = copy.deepcopy(train_info)
 
-        plt.savefig(dir+"/fold_{}_{}_classification_performances.png".format(fold, args.task), dpi=500)
+    # Training loop
+    for epoch in range(args.epoch):
+        logger.log(f'\n------ Epoch {epoch + 1}/{args.epoch}')
+        
+        # Training phase
+        logger.log('-- Training')
+        train_metrics = train_epoch(
+            model=model,
+            criterion=criterion,
+            loader=loaders['train'],
+            optimizer=optimizer,
+            args=args,
+            epoch=epoch,
+            phase='train',
+            logger=logger,
+            writer=writers['train']
+        )
 
-pickle.dump(kfold_best, open(rootdir + '/kfold_best.pkl', 'wb'), -1)
+        # Store training info
+        for key in train_info.keys():
+            if key in train_metrics:
+                train_info[key].append(train_metrics[key])
+
+        # Validation phase
+        logger.log('-- Validation')
+        valid_metrics = evaluate(
+            phase='valid',
+            model=model,
+            criterion=criterion,
+            data=loaders['valid'],
+            args=args,
+            task=args.task,
+            logger=logger,
+            tfw=writers['valid'],
+            epoch=epoch
+        )
+
+        # Store validation info
+        for key in valid_info.keys():
+            if key in valid_metrics:
+                valid_info[key].append(valid_metrics[key])
+
+        # Testing phase
+        logger.log('-- Testing')
+        test_metrics = evaluate(
+            phase='test',
+            model=model,
+            criterion=criterion,
+            data=loaders['test'],
+            args=args,
+            task=args.task,
+            logger=logger,
+            tfw=writers['test'],
+            epoch=epoch
+        )
+        
+        # Store test info
+        for key in test_info.keys():
+            if key in test_metrics:
+                test_info[key].append(test_metrics[key])
+
+        # Save best models and update metrics
+        for phase, metrics in zip(['train', 'valid', 'test'], 
+                                [train_metrics, valid_metrics, test_metrics]):
+            # Check if current model is best
+            is_best = False
+            if args.task == 'I' and metrics['mae'] < best_metrics[phase]['mae']:
+                is_best = True
+                best_metrics[phase].update({
+                    'epoch': epoch,
+                    'mae': metrics['mae'],
+                    'mre': metrics['mre']
+                })
+                
+                # Save visualization
+                get_polarfig(
+                    args, replacement_probs,
+                    missing_rates[phase],
+                    metrics['feature_mae'],
+                    save_dir, fold, phase,
+                    args.attributes
+                )
+                
+                # Log best metrics for imputation task
+                logger.log(f'Best {phase} metrics found!')
+                logger.log(f'MAE: {metrics["mae"]:.6f}')
+                logger.log(f'MRE: {metrics["mre"]:.6f}')
+                
+            elif args.task == 'C' and metrics['auc'] > best_metrics[phase]['auc']:
+                is_best = True
+                best_metrics[phase].update({
+                    'epoch': epoch,
+                    'mae': metrics['mae'],
+                    'mre': metrics['mre'],
+                    'accuracy': metrics['accuracy'],
+                    'auc': metrics['auc'],
+                    'prec_macro': metrics['prec_macro'],
+                    'recall_macro': metrics['recall_macro'],
+                    'f1_macro': metrics['f1_macro'],
+                    'bal_acc': metrics['bal_acc']
+                })
+                
+                # Save visualization
+                get_polarfig(
+                    args, replacement_probs,
+                    missing_rates[phase],
+                    metrics['feature_mae'],
+                    save_dir, fold, phase,
+                    args.attributes
+                )
+                
+                # Log best metrics for classification task
+                logger.log(f'Best {phase} metrics found!')
+                logger.log(f'AUC: {metrics["auc"]:.6f}')
+                logger.log(f'Accuracy: {metrics["accuracy"]:.6f}')
+                logger.log(f'MAE: {metrics["mae"]:.6f}')
+            
+            if is_best:
+                # Save model
+                save_path = save_dir / 'model_state' / f'model_{fold}_best_{phase}_{args.task}_state_dict.pth'
+                torch.save(model.state_dict(), save_path)
+                logger.log(f'Saved best {phase} model to {save_path}')
+    
+    # Save complete training info
+    training_record = {
+        'train': train_info,
+        'valid': valid_info,
+        'test': test_info
+    }
+    
+    save_training_info(
+        info=training_record,
+        save_dir=save_dir,
+        fold=fold,
+        args=args
+    )
+    
+    return best_metrics
+
+def main():
+    """Main training function."""
+    # Parse arguments and setup
+    args = parse_args()
+    args = setup_environment(args)
+
+    # Configure dataset-specific parameters
+    args = config(args)  # From utils.py
+
+    # Set paths
+    args.data_path = f'./data/{args.dataset}/data_nan.pkl'
+    args.label_path = f'./data/{args.dataset}/label.pkl'
+    
+    # Load data
+    kfold_data, kfold_label = load_data(args)
+    
+    # Store results for all folds
+    results = {}
+    
+    # Training loop for each fold
+    for fold in range(5):
+        print(f'\nProcessing Fold {fold+1}/5')
+        
+        # Setup tracking for this fold
+        logger, writers, save_dir = setup_fold_tracking(args, fold)
+        
+        # Prepare data
+        loaders, missing_rates, intervals, replacement_probs = prepare_fold_data(
+            fold, kfold_data, kfold_label, args
+        )
+        
+        # Initialize model
+        model, criterion, optimizer = initialize_model(args, intervals)
+        
+        # Train fold
+        fold_metrics = train_fold(
+            fold=fold,
+            model=model,
+            criterion=criterion,
+            optimizer=optimizer,
+            loaders=loaders,
+            args=args,
+            logger=logger,
+            writers=writers,
+            save_dir=save_dir,
+            missing_rates=missing_rates,
+            replacement_probs=replacement_probs
+        )
+        
+        # Store results
+        results[f'fold_{fold}'] = fold_metrics
+        
+        # Close writers
+        for writer in writers.values():
+            writer.close()
+        
+        # Log final results for fold
+        logger.log('\nFinal Best Results:')
+        for phase in ['train', 'valid', 'test']:
+            logger.log(f'\n{phase.upper()} METRICS:')
+            for metric, value in fold_metrics[phase].items():
+                if isinstance(value, (int, float)):
+                    logger.log(f'{metric}: {value:.6f}')
+    
+    # Save overall results
+    result_path = Path(args.model_path) / args.dataset / \
+                 f'{args.model_name}_remove_{args.removal_percent}' / \
+                 f'task_{args.task}' / 'kfold_best.pkl'
+    
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(result_path, 'wb') as f:
+        pickle.dump(results, f, protocol=-1)
+    
+    print('\nTraining completed successfully!')
+
+if __name__ == '__main__':
+    main()
+
+
+
+
+
+
+
+
+

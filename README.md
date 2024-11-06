@@ -1,6 +1,6 @@
 # CSAI: Knowledge Enhanced Conditional Imputation for Healthcare Time-series
 
-Official implementation of "Knowledge Enhanced Conditional Imputation for Healthcare Time-series"
+Official implementation of "[Knowledge Enhanced Conditional Imputation for Healthcare Time-series](https://arxiv.org/pdf/2312.16713)"
 
 ## Overview
 
@@ -27,6 +27,19 @@ conda env create -f csai.yml
 # Activate environment
 conda activate csai
 ```
+Or
+```bash
+# Clone the repository
+git clone https://github.com/LinglongQian/CSAI.git
+cd CSAI
+
+python -m venv csai
+
+source csai/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
 
 ## Dataset Preparation
 
@@ -47,16 +60,20 @@ The implementation supports three healthcare benchmark datasets:
 Place the downloaded data in the `data/` directory following this structure:
 ```
 data/
-├── physionet/
-├── mimic_59f/
-└── eicu/
+├── physionet_raw/
+├── mimic_59f_raw/
+└── eicu_raw/
 ```
 
 ## Usage
 
 ### Data Preprocessing
 ```bash
-python process_physionet.py --data_dir ./data/physionet --output_dir ./data/physionet [--n_splits 5] [--seed 3407]
+python data_process.py \
+   --data_dir ./data/physionet_raw \
+   --output_dir ./data/physionet \
+   --n_splits 5 \
+   --seed 3407
 ```
 
 ### Training example
@@ -69,6 +86,49 @@ python main.py \
     --epoch 300 \
     --lr 0.0005 \
     --batchsize 64
+```
+
+### Training Arguments
+```
+Hardware:
+  --gpu_id        GPU device ID
+  --seed          Random seed for reproducibility
+
+Model:
+  --model_name    Model architecture [CSAI, Brits, GRUD, BVRIN, MRNN]
+  --hiddens      Hidden layer size
+  --channels     Number of channels
+  --step_channels Step channels for transformer
+
+Training:
+  --task         Task type [I: Imputation, C: Classification]
+  --epoch        Number of training epochs
+  --lr          Learning rate
+  --batchsize   Batch size
+  --weight_decay Weight decay factor
+
+Loss Weights:
+  --imputation_weight      Weight for imputation loss
+  --classification_weight  Weight for classification loss (task C)
+  --consistency_weight    Weight for consistency loss
+```
+
+### Results Processing
+Process and analyze training results:
+```bash
+python result_process.py \
+    --log_dir ./log \
+    --dataset physionet \
+    --key_pattern bets_valid \
+    --results_dir results
+```
+
+### Processing Arguments
+```
+--log_dir      Root directory containing experiment logs
+--dataset      Dataset name [physionet, mimic_59f, eicu]
+--key_pattern  Pattern to match in result keys
+--results_dir  Directory to save processed results
 ```
 
 ## Citation
