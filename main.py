@@ -26,7 +26,8 @@ warnings.filterwarnings("ignore")
 from utils import (
     setup_seed, normalize, calculate_metrics,
     get_polarfig, ExperimentLogger, save_training_info,
-    non_uniform_sample_loader_bidirectional, evaluate, config
+    non_uniform_sample_loader_bidirectional, evaluate, config,
+    MemoryTracker, EarlyStopping,
 )
 from losses import DiceBCELoss
 
@@ -66,7 +67,24 @@ def parse_args():
     # Output configs
     parser.add_argument("--model_path", type=str, default='./log')
     parser.add_argument("--out_size", type=int, default=1)
+
+    # Early stopping parameters
+    parser.add_argument('--patience_mae', type=int, default=10, help='Patience for MAE improvement')
+    parser.add_argument('--patience_loss', type=int, default=7, help='Patience for loss improvement')
+    parser.add_argument('--patience_auc', type=int, default=15, help='Patience for AUC improvement (classification only)')
+    parser.add_argument('--min_delta', type=float, default=1e-4, help='Minimum change in monitored metrics to qualify as an improvement')
     
+    # Memory management
+    parser.add_argument("--mixed_precision", type=bool, default=False, help='Enable mixed precision training')
+    parser.add_argument("--gradient_checkpointing", type=bool, default=False, help='Enable gradient checkpointing')
+    parser.add_argument("--cache_size", type=float, default=4.0, help='Size of tensor cache in GB')
+    parser.add_argument("--memory_check_freq", type=int, default=100, help='Frequency of memory usage checks')
+    parser.add_argument("--data_chunk_size", type=int, default=1000, help='Size of data chunks for loading')
+    parser.add_argument("--min_batchsize", type=int, default=8, help='Minimum batch size')
+    parser.add_argument("--max_batchsize", type=int, default=128, help='Maximum batch size')
+    parser.add_argument("--grad_clip", type=bool, default=False, help='Enable gradient clipping')
+    parser.add_argument("--grad_clip_value", type=float, default=1.0, help='Gradient clipping value')
+
     args = parser.parse_args()
     return args
 
@@ -200,8 +218,14 @@ def initialize_model(args, intervals):
         lr=args.lr,
         weight_decay=args.weight_decay
     )
-    
-    return model, criterion, optimizer
+
+    scheduler = optim.lr_scheduler.MultiStepLR(
+        optimizer,
+        milestones=[args.epoch * 0.5, args.epoch * 0.75],
+        gamma=0.1
+    )
+
+    return model, criterion, optimizer, scheduler
 
 def train_epoch(
     model: torch.nn.Module,
@@ -317,15 +341,38 @@ def train_fold(
     model: torch.nn.Module,
     criterion: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler,
     loaders: Dict[str, torch.utils.data.DataLoader],
     args,
     logger: ExperimentLogger,
     writers: Dict[str, SummaryWriter],
     save_dir: Path,
     missing_rates: Dict[str, np.ndarray],
-    replacement_probs: np.ndarray
+    replacement_probs: np.ndarray,
+    scheduler_use: bool = False,
+    use_early_stopping: bool = False
 ) -> Dict:
     """Train and evaluate a single fold."""
+
+    if use_early_stopping:
+        # Initialize early stopping
+        early_stopping = EarlyStopping(
+            patience={
+                'mae': args.patience_mae,  # e.g., 10 epochs
+                'loss': args.patience_loss,  # e.g., 7 epochs
+                'auc': args.patience_auc if args.task == 'C' else 0  # e.g., 15 epochs
+            },
+            mode={
+                'mae': 'min',
+                'loss': 'min',
+                'auc': 'max'
+            },
+            min_delta=args.min_delta,  # e.g., 1e-4
+            save_dir=save_dir / 'checkpoints',
+            check_finite=True
+        )
+
+    # Initialize best metrics
     best_metrics = {
         'train': {'epoch': 0, 'mae': float('inf'), 'auc': 0},
         'valid': {'epoch': 0, 'mae': float('inf'), 'auc': 0},
@@ -401,6 +448,45 @@ def train_fold(
             if key in test_metrics:
                 test_info[key].append(test_metrics[key])
 
+        if use_early_stopping:
+            # Check early stopping criteria
+            stop_signals, improvements = early_stopping(
+                metrics={
+                    'mae': valid_metrics['mae'],
+                    'loss': valid_metrics['loss'],
+                    'auc': valid_metrics['auc'] if args.task == 'C' else 0
+                },
+                epoch=epoch,
+                model=model,
+                model_id=f'fold_{fold}'
+            )
+        
+            # Log improvements
+            for metric, improved in improvements.items():
+                if improved:
+                    logger.log(f"New best {metric} at epoch {epoch}")
+                    
+                    # Create visualization if metric improved
+                    if metric in ['mae', 'auc']:
+                        get_polarfig(
+                            args, replacement_probs,
+                            missing_rates['valid'],
+                            valid_metrics['feature_mae'],
+                            save_dir, fold, 'valid',
+                            args.attributes
+                        )
+            
+            # Check if we should stop training
+            if early_stopping.should_stop_overall(stop_signals):
+                logger.log(
+                    f"Early stopping triggered at epoch {epoch}. "
+                    f"Best results: {early_stopping.get_best_results()}"
+                )
+                break
+
+        if scheduler_use:
+            scheduler.step()
+
         # Save best models and update metrics
         for phase, metrics in zip(['train', 'valid', 'test'], 
                                 [train_metrics, valid_metrics, test_metrics]):
@@ -462,14 +548,27 @@ def train_fold(
                 save_path = save_dir / 'model_state' / f'model_{fold}_best_{phase}_{args.task}_state_dict.pth'
                 torch.save(model.state_dict(), save_path)
                 logger.log(f'Saved best {phase} model to {save_path}')
-    
+
+    if use_early_stopping:
+        # Get final best results
+        best_results = early_stopping.get_best_results()
+
+        # Log final results
+        logger.log('\nTraining completed!')
+        logger.log('Best results:')
+        for metric, result in best_results.items():
+            logger.log(f"{metric}: {result['score']:.6f} (epoch {result['epoch']})")
+
     # Save complete training info
     training_record = {
         'train': train_info,
         'valid': valid_info,
-        'test': test_info
+        'test': test_info,
     }
-    
+
+    if use_early_stopping:
+        training_record['best_results'] = best_results
+        
     save_training_info(
         info=training_record,
         save_dir=save_dir,
@@ -491,7 +590,11 @@ def main():
     # Set paths
     args.data_path = f'./data/{args.dataset}/data_nan.pkl'
     args.label_path = f'./data/{args.dataset}/label.pkl'
-    
+
+    # Initialize memory tracking
+    memory_tracker = MemoryTracker()
+    logger.info(f"Initial memory usage: {memory_tracker.get_memory_stats()}")
+
     # Load data
     kfold_data, kfold_label = load_data(args)
     
@@ -511,7 +614,7 @@ def main():
         )
         
         # Initialize model
-        model, criterion, optimizer = initialize_model(args, intervals)
+        model, criterion, optimizer, scheduler = initialize_model(args, intervals)
         
         # Train fold
         fold_metrics = train_fold(
@@ -519,6 +622,7 @@ def main():
             model=model,
             criterion=criterion,
             optimizer=optimizer,
+            scheduler=scheduler,
             loaders=loaders,
             args=args,
             logger=logger,

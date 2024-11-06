@@ -10,7 +10,7 @@ This module contains helper functions for:
 import os
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Optional, Union, Tuple, Any
 from collections import defaultdict
 
 import numpy as np
@@ -30,12 +30,565 @@ import pickle
 
 from torch.utils.tensorboard import SummaryWriter
 
+import gc
+import psutil
+from contextlib import contextmanager
+from dataclasses import dataclass
+import weakref
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# ================ Memory Management ================
+@dataclass
+class MemoryStats:
+    """Container for memory usage statistics."""
+    cpu_used: float
+    cpu_total: float
+    gpu_used: Optional[float] = None
+    gpu_total: Optional[float] = None
+    
+    def __str__(self) -> str:
+        stats = [
+            f"CPU: {self.cpu_used:.1f}GB / {self.cpu_total:.1f}GB "
+            f"({100 * self.cpu_used/self.cpu_total:.1f}%)"
+        ]
+        if self.gpu_used is not None:
+            stats.append(
+                f"GPU: {self.gpu_used:.1f}GB / {self.gpu_total:.1f}GB "
+                f"({100 * self.gpu_used/self.gpu_total:.1f}%)"
+            )
+        return ", ".join(stats)
+
+class MemoryTracker:
+    """
+    Track memory usage and provide optimization suggestions.
+    
+    Features:
+    - CPU and GPU memory monitoring
+    - Memory leak detection
+    - Automatic garbage collection
+    - Warning thresholds
+    """
+    
+    def __init__(
+        self,
+        cpu_warning_threshold: float = 0.85,
+        gpu_warning_threshold: float = 0.85,
+        device: torch.device = None
+    ):
+        """
+        Initialize memory tracker.
+        
+        Args:
+            cpu_warning_threshold: Fraction of CPU memory that triggers warning
+            gpu_warning_threshold: Fraction of GPU memory that triggers warning
+            device: PyTorch device to monitor
+        """
+        self.cpu_warning_threshold = cpu_warning_threshold
+        self.gpu_warning_threshold = gpu_warning_threshold
+        self.device = device
+        self.memory_peaks = defaultdict(float)
+        self.tensor_refs = weakref.WeakSet()
+        
+    def get_memory_stats(self) -> MemoryStats:
+        """Get current memory usage statistics."""
+        # CPU memory
+        process = psutil.Process(os.getpid())
+        cpu_used = process.memory_info().rss / (1024 ** 3)  # GB
+        cpu_total = psutil.virtual_memory().total / (1024 ** 3)  # GB
+        
+        stats = MemoryStats(cpu_used=cpu_used, cpu_total=cpu_total)
+        
+        # GPU memory if available
+        if torch.cuda.is_available():
+            gpu_used = torch.cuda.memory_allocated() / (1024 ** 3)  # GB
+            gpu_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)  # GB
+            stats.gpu_used = gpu_used
+            stats.gpu_total = gpu_total
+            
+        return stats
+    
+    def check_memory_usage(self) -> None:
+        """Check memory usage and issue warnings if thresholds exceeded."""
+        stats = self.get_memory_stats()
+        
+        # Update peaks
+        self.memory_peaks['cpu'] = max(self.memory_peaks['cpu'], stats.cpu_used)
+        if stats.gpu_used is not None:
+            self.memory_peaks['gpu'] = max(self.memory_peaks['gpu'], stats.gpu_used)
+        
+        # Check CPU usage
+        if stats.cpu_used / stats.cpu_total > self.cpu_warning_threshold:
+            logger.warning(
+                f"High CPU memory usage: {stats.cpu_used:.1f}GB / {stats.cpu_total:.1f}GB"
+            )
+            self._suggest_optimizations('cpu')
+            
+        # Check GPU usage
+        if (stats.gpu_used is not None and 
+            stats.gpu_used / stats.gpu_total > self.gpu_warning_threshold):
+            logger.warning(
+                f"High GPU memory usage: {stats.gpu_used:.1f}GB / {stats.gpu_total:.1f}GB"
+            )
+            self._suggest_optimizations('gpu')
+    
+    def _suggest_optimizations(self, memory_type: str) -> None:
+        """Provide optimization suggestions based on memory type."""
+        if memory_type == 'cpu':
+            suggestions = [
+                "Consider using smaller batch sizes",
+                "Enable memory pinning with pin_memory=True in DataLoader",
+                "Use memory mapping for large files",
+                "Clear unused variables and call gc.collect()"
+            ]
+        else:  # gpu
+            suggestions = [
+                "Use gradient checkpointing for large models",
+                "Enable mixed precision training",
+                "Clear GPU cache between iterations",
+                "Move intermediate tensors to CPU when not needed"
+            ]
+            
+        logger.info("Memory optimization suggestions:")
+        for i, suggestion in enumerate(suggestions, 1):
+            logger.info(f"{i}. {suggestion}")
+    
+    def track_tensor(self, tensor: torch.Tensor) -> None:
+        """Track a tensor for memory monitoring."""
+        self.tensor_refs.add(tensor)
+    
+    def clear_cache(self) -> None:
+        """Clear memory caches and run garbage collection."""
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+    def get_peak_memory(self) -> Dict[str, float]:
+        """Get peak memory usage."""
+        return dict(self.memory_peaks)
+    
+    def reset_peak_memory(self) -> None:
+        """Reset peak memory tracking."""
+        self.memory_peaks.clear()
+
+@contextmanager
+def track_memory_usage(
+    tracker: Optional[MemoryTracker] = None,
+    label: str = ""
+) -> None: # type: ignore
+    """
+    Context manager for tracking memory usage.
+    
+    Args:
+        tracker: Memory tracker instance
+        label: Label for this tracking session
+    """
+    if tracker is None:
+        tracker = MemoryTracker()
+        
+    try:
+        start_stats = tracker.get_memory_stats()
+        logger.info(f"Starting {label}: {start_stats}")
+        yield tracker
+    finally:
+        end_stats = tracker.get_memory_stats()
+        logger.info(f"Ending {label}: {end_stats}")
+        
+class TensorCache:
+    """
+    Cache for managing tensor storage and reuse.
+    
+    Features:
+    - Automatic tensor reuse
+    - Size-based eviction
+    - Device management
+    """
+    
+    def __init__(
+        self,
+        max_size_gb: float = 4.0,
+        device: torch.device = None
+    ):
+        """
+        Initialize tensor cache.
+        
+        Args:
+            max_size_gb: Maximum cache size in gigabytes
+            device: PyTorch device for tensors
+        """
+        self.max_size = max_size_gb * (1024 ** 3)  # Convert to bytes
+        self.device = device
+        self.cache = {}
+        self.size_track = defaultdict(int)
+        
+    def get(self, key: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        """
+        Get a tensor from cache or create new one.
+        
+        Args:
+            key: Tensor shape
+            dtype: Tensor data type
+            
+        Returns:
+            Cached or new tensor
+        """
+        cache_key = (key, dtype)
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+            
+        # Create new tensor
+        tensor = torch.empty(key, dtype=dtype, device=self.device)
+        self._add_to_cache(cache_key, tensor)
+        return tensor
+    
+    def _add_to_cache(self, key: Tuple, tensor: torch.Tensor) -> None:
+        """Add tensor to cache with size tracking."""
+        tensor_size = tensor.numel() * tensor.element_size()
+        
+        # Evict items if needed
+        while self.total_size + tensor_size > self.max_size:
+            self._evict_one()
+            
+        self.cache[key] = tensor
+        self.size_track[key] = tensor_size
+        
+    def _evict_one(self) -> None:
+        """Evict least recently used item from cache."""
+        if not self.cache:
+            return
+            
+        key = next(iter(self.cache))
+        del self.cache[key]
+        del self.size_track[key]
+        
+    @property
+    def total_size(self) -> int:
+        """Get total size of cached tensors in bytes."""
+        return sum(self.size_track.values())
+    
+    def clear(self) -> None:
+        """Clear the cache."""
+        self.cache.clear()
+        self.size_track.clear()
+
+def optimize_tensor(
+    tensor: torch.Tensor,
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[torch.device] = None,
+    pin_memory: bool = False
+) -> torch.Tensor:
+    """
+    Optimize tensor storage and placement.
+    
+    Args:
+        tensor: Input tensor
+        dtype: Target data type
+        device: Target device
+        pin_memory: Whether to pin memory
+        
+    Returns:
+        Optimized tensor
+    """
+    if dtype is not None and tensor.dtype != dtype:
+        tensor = tensor.to(dtype)
+        
+    if device is not None and tensor.device != device:
+        tensor = tensor.to(device)
+        
+    if pin_memory and not tensor.is_pinned():
+        tensor = tensor.pin_memory()
+        
+    return tensor
+
+def optimize_model_memory(
+    model: torch.nn.Module,
+    use_mixed_precision: bool = False,
+    use_gradient_checkpointing: bool = False
+) -> torch.nn.Module:
+    """
+    Apply memory optimizations to model.
+    
+    Args:
+        model: PyTorch model
+        use_mixed_precision: Whether to use mixed precision training
+        use_gradient_checkpointing: Whether to use gradient checkpointing
+        
+    Returns:
+        Optimized model
+    """
+    if use_mixed_precision:
+        model = model.half()
+        
+    if use_gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+        
+    return model
+
+class BatchSizeOptimizer:
+    """
+    Dynamic batch size optimizer based on memory usage.
+    
+    Features:
+    - Automatic batch size adjustment
+    - Memory monitoring
+    - Gradual scaling
+    """
+    
+    def __init__(
+        self,
+        initial_batch_size: int,
+        min_batch_size: int,
+        max_batch_size: int,
+        target_memory_usage: float = 0.8,
+        scaling_factor: float = 1.2
+    ):
+        """
+        Initialize batch size optimizer.
+        
+        Args:
+            initial_batch_size: Starting batch size
+            min_batch_size: Minimum allowed batch size
+            max_batch_size: Maximum allowed batch size
+            target_memory_usage: Target memory utilization
+            scaling_factor: Factor for batch size adjustments
+        """
+        self.current_batch_size = initial_batch_size
+        self.min_batch_size = min_batch_size
+        self.max_batch_size = max_batch_size
+        self.target_memory_usage = target_memory_usage
+        self.scaling_factor = scaling_factor
+        self.memory_tracker = MemoryTracker()
+        
+    def update_batch_size(self) -> int:
+        """
+        Update batch size based on current memory usage.
+        
+        Returns:
+            New batch size
+        """
+        stats = self.memory_tracker.get_memory_stats()
+        
+        # Calculate memory utilization
+        if stats.gpu_used is not None:
+            memory_util = stats.gpu_used / stats.gpu_total
+        else:
+            memory_util = stats.cpu_used / stats.cpu_total
+            
+        # Adjust batch size
+        if memory_util > self.target_memory_usage:
+            # Decrease batch size
+            self.current_batch_size = max(
+                self.min_batch_size,
+                int(self.current_batch_size / self.scaling_factor)
+            )
+        elif memory_util < self.target_memory_usage * 0.8:
+            # Increase batch size
+            self.current_batch_size = min(
+                self.max_batch_size,
+                int(self.current_batch_size * self.scaling_factor)
+            )
+            
+        return self.current_batch_size
+
+# ================ EarlyStopping Handler ================
+class EarlyStopping:
+    """
+    Early stopping handler with support for multiple criteria and model checkpointing.
+    
+    Features:
+    - Multiple metric monitoring
+    - Flexible patience per metric
+    - Best model checkpointing
+    - Training statistics tracking
+    """
+    
+    def __init__(
+        self,
+        patience: Dict[str, int],
+        mode: Dict[str, str],
+        min_delta: float = 0.0,
+        baseline: Optional[Dict[str, float]] = None,
+        save_dir: Optional[Path] = None,
+        check_finite: bool = True,
+    ):
+        """
+        Initialize early stopping handler.
+        
+        Args:
+            patience: Dictionary mapping metric names to patience values
+            mode: Dictionary specifying 'min' or 'max' for each metric
+            min_delta: Minimum change in monitored metrics to qualify as improvement
+            baseline: Optional baseline values for metrics
+            save_dir: Directory to save model checkpoints
+            check_finite: Whether to check for finite values in metrics
+        """
+        self.patience = patience
+        self.mode = mode
+        self.min_delta = min_delta
+        self.baseline = baseline or {}
+        self.save_dir = save_dir
+        self.check_finite = check_finite
+        
+        # Initialize counters and best values
+        self.counters = {metric: 0 for metric in patience.keys()}
+        self.best_scores = {metric: None for metric in patience.keys()}
+        self.best_epochs = {metric: None for metric in patience.keys()}
+        
+        # Validation
+        self._validate_inputs()
+        
+        # Create save directory if needed
+        if save_dir:
+            save_dir.mkdir(parents=True, exist_ok=True)
+    
+    def _validate_inputs(self):
+        """Validate initialization parameters."""
+        if not self.patience:
+            raise ValueError("At least one metric must be specified for patience")
+            
+        if set(self.patience.keys()) != set(self.mode.keys()):
+            raise ValueError("Patience and mode must have the same metrics")
+            
+        for metric, mode in self.mode.items():
+            if mode not in ['min', 'max']:
+                raise ValueError(f"Mode for {metric} must be 'min' or 'max', got {mode}")
+    
+    def _is_improvement(self, current: float, best: float, mode: str) -> bool:
+        """
+        Check if current value is an improvement over best value.
+        
+        Args:
+            current: Current metric value
+            best: Best metric value so far
+            mode: 'min' or 'max'
+            
+        Returns:
+            True if current value is an improvement
+        """
+        if best is None:
+            return True
+            
+        if self.check_finite and not np.isfinite(current):
+            return False
+            
+        if mode == 'min':
+            return current < (best - self.min_delta)
+        return current > (best + self.min_delta)
+    
+    def __call__(
+        self,
+        metrics: Dict[str, float],
+        epoch: int,
+        model: torch.nn.Module,
+        model_id: Optional[str] = None,
+    ) -> Dict[str, bool]:
+        """
+        Check early stopping criteria and save model if improved.
+        
+        Args:
+            metrics: Dictionary of current metric values
+            epoch: Current epoch number
+            model: Model to save if improved
+            model_id: Optional identifier for model checkpoints
+            
+        Returns:
+            Dictionary indicating whether to stop for each metric
+        """
+        stop_signals = {}
+        improvements = {}
+        
+        for metric_name, current_value in metrics.items():
+            if metric_name not in self.patience:
+                continue
+                
+            # Check if current value is an improvement
+            is_improvement = self._is_improvement(
+                current_value,
+                self.best_scores[metric_name],
+                self.mode[metric_name]
+            )
+            
+            improvements[metric_name] = is_improvement
+            
+            if is_improvement:
+                # Update best score and reset counter
+                self.best_scores[metric_name] = current_value
+                self.best_epochs[metric_name] = epoch
+                self.counters[metric_name] = 0
+                
+                # Save model if improved
+                if self.save_dir:
+                    self._save_checkpoint(model, metric_name, epoch, model_id)
+            else:
+                # Increment counter if no improvement
+                self.counters[metric_name] += 1
+            
+            # Check if we should stop for this metric
+            stop_signals[metric_name] = self.counters[metric_name] >= self.patience[metric_name]
+            
+            # Log status
+            self._log_status(metric_name, current_value, epoch)
+        
+        return stop_signals, improvements
+    
+    def _save_checkpoint(
+        self,
+        model: torch.nn.Module,
+        metric_name: str,
+        epoch: int,
+        model_id: Optional[str] = None
+    ):
+        """Save model checkpoint."""
+        if model_id:
+            filename = f"best_{model_id}_{metric_name}_epoch_{epoch}.pt"
+        else:
+            filename = f"best_{metric_name}_epoch_{epoch}.pt"
+            
+        save_path = self.save_dir / filename
+        
+        # Save model
+        if isinstance(model, torch.nn.DataParallel):
+            torch.save(model.module.state_dict(), save_path)
+        else:
+            torch.save(model.state_dict(), save_path)
+        
+        logger.info(f"Saved best model for {metric_name} to {save_path}")
+    
+    def _log_status(self, metric_name: str, current_value: float, epoch: int):
+        """Log early stopping status for metric."""
+        logger.info(
+            f"{metric_name}: {current_value:.6f} "
+            f"(best: {self.best_scores[metric_name]:.6f} @ epoch {self.best_epochs[metric_name]}, "
+            f"counter: {self.counters[metric_name]}/{self.patience[metric_name]})"
+        )
+    
+    def get_best_results(self) -> Dict[str, Dict[str, float]]:
+        """Get best results for all monitored metrics."""
+        return {
+            metric: {
+                'score': self.best_scores[metric],
+                'epoch': self.best_epochs[metric]
+            }
+            for metric in self.patience.keys()
+        }
+    
+    def should_stop_overall(self, stop_signals: Dict[str, bool]) -> bool:
+        """
+        Determine if training should stop based on all metrics.
+        
+        Args:
+            stop_signals: Dictionary of stop signals for each metric
+            
+        Returns:
+            True if training should stop
+        """
+        # Stop if any metric has reached its patience limit
+        return any(stop_signals.values())
+
 
 # ================ Data Processing Functions ================
 def normalize(data: np.ndarray, 
